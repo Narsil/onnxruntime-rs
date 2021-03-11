@@ -222,6 +222,20 @@ impl<'a> SessionBuilder<'a> {
         let input_ort_values: Vec<*const sys::OrtValue> = Vec::with_capacity(inputs.len());
         let output_tensor_ptrs: Vec<*mut sys::OrtValue> = vec![std::ptr::null_mut(); outputs.len()];
         let output_tensor_idx = 0;
+        let input_names: Vec<String> = inputs.iter().map(|input| input.name.clone()).collect();
+        let input_names_cstring: Vec<CString> = input_names
+            .iter()
+            .cloned()
+            .map(|n| CString::new(n).unwrap())
+            .collect();
+
+        let output_names: Vec<String> = outputs.iter().map(|output| output.name.clone()).collect();
+        let output_names_cstring: Vec<CString> = output_names
+            .into_iter()
+            .map(|n| CString::new(n).unwrap())
+            .collect();
+
+        // println!("Output names {:?}", output_names_cstring);
 
         Ok(Session {
             env: self.env,
@@ -233,6 +247,8 @@ impl<'a> SessionBuilder<'a> {
             input_ort_values,
             output_tensor_ptrs,
             output_tensor_idx,
+            input_names_cstring,
+            output_names_cstring,
         })
     }
 
@@ -285,6 +301,18 @@ impl<'a> SessionBuilder<'a> {
         let input_ort_values: Vec<*const sys::OrtValue> = vec![std::ptr::null_mut(); inputs.len()];
         let output_tensor_ptrs: Vec<*mut sys::OrtValue> = vec![std::ptr::null_mut(); outputs.len()];
         let output_tensor_idx = 0;
+        let input_names: Vec<String> = inputs.iter().map(|input| input.name.clone()).collect();
+        let input_names_cstring: Vec<CString> = input_names
+            .iter()
+            .cloned()
+            .map(|n| CString::new(n).unwrap())
+            .collect();
+
+        let output_names: Vec<String> = outputs.iter().map(|output| output.name.clone()).collect();
+        let output_names_cstring: Vec<CString> = output_names
+            .into_iter()
+            .map(|n| CString::new(n).unwrap())
+            .collect();
 
         Ok(Session {
             env: self.env,
@@ -296,6 +324,8 @@ impl<'a> SessionBuilder<'a> {
             input_ort_values,
             output_tensor_ptrs,
             output_tensor_idx,
+            input_names_cstring,
+            output_names_cstring,
         })
     }
 }
@@ -314,6 +344,8 @@ pub struct Session<'a> {
     input_ort_values: Vec<*const sys::OrtValue>,
     output_tensor_ptrs: Vec<*mut sys::OrtValue>,
     output_tensor_idx: usize,
+    input_names_cstring: Vec<CString>,
+    output_names_cstring: Vec<CString>,
 }
 
 /// Information about an ONNX's input as stored in loaded file
@@ -418,28 +450,7 @@ impl<'a> Session<'a> {
             .for_each(|input_array| self.feed(input_array).unwrap());
         self.inner_run().unwrap();
 
-        let memory_info_ref = &self.memory_info;
-        let outputs: Result<Vec<OrtOwnedTensor<TOut, ndarray::Dim<ndarray::IxDynImpl>>>> = self
-            .output_tensor_ptrs
-            .clone()
-            .into_iter()
-            .map(|ptr| {
-                let mut tensor_info_ptr: *mut sys::OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
-                let status = unsafe {
-                    g_ort().GetTensorTypeAndShape.unwrap()(ptr, &mut tensor_info_ptr as _)
-                };
-                status_to_result(status).map_err(OrtError::GetTensorTypeAndShape)?;
-                let dims = unsafe { get_tensor_dimensions(tensor_info_ptr) };
-                unsafe { g_ort().ReleaseTensorTypeAndShapeInfo.unwrap()(tensor_info_ptr) };
-                let dims: Vec<_> = dims?.iter().map(|&n| n as usize).collect();
-
-                let mut output_tensor_extractor =
-                    OrtOwnedTensorExtractor::new(memory_info_ref, ndarray::IxDyn(&dims));
-                output_tensor_extractor.tensor_ptr = ptr;
-                output_tensor_extractor.extract::<TOut>()
-            })
-            .collect();
-        outputs
+        self.read_vec(self.outputs.len())
     }
     /// Run the input data through the ONNX graph, performing inference.
     ///
@@ -479,33 +490,18 @@ impl<'a> Session<'a> {
         self.output_tensor_idx = 0;
         self.output_tensor_ptrs = vec![std::ptr::null_mut(); self.outputs.len()];
 
-        let input_names: Vec<String> = self.inputs.iter().map(|input| input.name.clone()).collect();
-        let input_names_cstring: Vec<CString> = input_names
-            .iter()
-            .cloned()
-            .map(|n| CString::new(n).unwrap())
-            .collect();
-        let input_names_ptr: Vec<*const i8> = input_names_cstring
-            .into_iter()
-            .map(|n| n.into_raw() as *const i8)
-            .collect();
+        let run_options_ptr: *const sys::OrtRunOptions = std::ptr::null();
 
-        let output_names: Vec<String> = self
-            .outputs
-            .iter()
-            .map(|output| output.name.clone())
-            .collect();
-        let output_names_cstring: Vec<CString> = output_names
-            .into_iter()
-            .map(|n| CString::new(n).unwrap())
-            .collect();
-        let output_names_ptr: Vec<*const i8> = output_names_cstring
+        let input_names_ptr: Vec<*const i8> = self
+            .input_names_cstring
             .iter()
             .map(|n| n.as_ptr() as *const i8)
             .collect();
-
-        let run_options_ptr: *const sys::OrtRunOptions = std::ptr::null();
-
+        let output_names_ptr: Vec<*const i8> = self
+            .output_names_cstring
+            .iter()
+            .map(|n| n.as_ptr() as *const i8)
+            .collect();
         let status = unsafe {
             g_ort().Run.unwrap()(
                 self.session_ptr,
@@ -523,13 +519,13 @@ impl<'a> Session<'a> {
         self.input_ort_values.clear();
 
         // Reconvert to CString so drop impl is called and memory is freed
-        let _: Vec<CString> = input_names_ptr
-            .into_iter()
-            .map(|p| {
-                assert_ne!(p, std::ptr::null());
-                unsafe { CString::from_raw(p as *mut i8) }
-            })
-            .collect();
+        // let _: Vec<CString> = self.input_names_ptr
+        //     .into_iter()
+        //     .map(|p| {
+        //         assert_ne!(p, std::ptr::null());
+        //         unsafe { CString::from_raw(p as *mut i8) }
+        //     })
+        //     .collect();
 
         // outputs
         Ok(())
@@ -562,6 +558,42 @@ impl<'a> Session<'a> {
             OrtOwnedTensorExtractor::new(memory_info_ref, ndarray::IxDyn(&dims));
         output_tensor_extractor.tensor_ptr = ptr;
         output_tensor_extractor.extract::<TOut>()
+    }
+
+    /// Doc
+    pub fn read_vec<'s, 'm, 't, TOut>(
+        &'s mut self,
+        n: usize,
+    ) -> Result<Vec<OrtOwnedTensor<'t, 'm, TOut, ndarray::IxDyn>>>
+    where
+        TOut: TypeToTensorElementDataType + Debug + Clone,
+        'm: 't,
+        's: 'm,
+    {
+        let memory_info_ref = &self.memory_info;
+        let outputs: Result<Vec<OrtOwnedTensor<TOut, ndarray::Dim<ndarray::IxDynImpl>>>> = self
+            .output_tensor_ptrs
+            .clone()
+            .into_iter()
+            .skip(self.output_tensor_idx)
+            .take(n)
+            .map(|ptr| {
+                let mut tensor_info_ptr: *mut sys::OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
+                let status = unsafe {
+                    g_ort().GetTensorTypeAndShape.unwrap()(ptr, &mut tensor_info_ptr as _)
+                };
+                status_to_result(status).map_err(OrtError::GetTensorTypeAndShape)?;
+                let dims = unsafe { get_tensor_dimensions(tensor_info_ptr) };
+                unsafe { g_ort().ReleaseTensorTypeAndShapeInfo.unwrap()(tensor_info_ptr) };
+                let dims: Vec<_> = dims?.iter().map(|&n| n as usize).collect();
+
+                let mut output_tensor_extractor =
+                    OrtOwnedTensorExtractor::new(memory_info_ref, ndarray::IxDyn(&dims));
+                output_tensor_extractor.tensor_ptr = ptr;
+                output_tensor_extractor.extract::<TOut>()
+            })
+            .collect();
+        outputs
     }
 
     // pub fn tensor_from_array<'a, 'b, T, D>(&'a self, array: Array<T, D>) -> Tensor<'b, T, D>
