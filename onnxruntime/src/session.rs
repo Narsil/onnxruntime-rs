@@ -543,6 +543,10 @@ impl<'a> Session<'a> {
         if self.output_tensor_idx > self.output_tensor_ptrs.len() {
             panic!("Trying to read inexistent tensor");
         }
+        // println!(
+        //     "Reading {:?}",
+        //     self.output_names_cstring[self.output_tensor_idx]
+        // );
         let ptr = self.output_tensor_ptrs[self.output_tensor_idx];
         self.output_tensor_idx += 1;
         let mut tensor_info_ptr: *mut sys::OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
